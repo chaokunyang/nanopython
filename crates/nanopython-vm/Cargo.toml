@@ -1,0 +1,11 @@
+[package]
+name = "nanopython-vm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nanopython-core = { path = "../nanopython-core" }
+nanopython-plugin-api = { path = "../nanopython-plugin-api" }
+rustpython-vm.workspace = true
+rustpython-pylib.workspace = true

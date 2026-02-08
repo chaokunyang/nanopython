@@ -1,0 +1,35 @@
+[workspace]
+members = [
+  "crates/nanopython-core",
+  "crates/nanopython-plugin-api",
+  "crates/nanopython-parser",
+  "crates/nanopython-compiler",
+  "crates/nanopython-gc-rc",
+  "crates/nanopython-import",
+  "crates/nanopython-stdlib-core",
+  "crates/nanopython-feature-enum-lite",
+  "crates/nanopython-feature-dataclass-lite",
+  "crates/nanopython-selfvm",
+  "crates/nanopython-vm",
+  "crates/nanopython-bin-self",
+  "crates/nanopython-bin-min",
+  "crates/nanopython-bin-extended",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+rustpython-vm = { version = "0.4.0", default-features = false, features = ["compiler", "importlib", "encodings"] }
+rustpython-pylib = "0.4.0"
+thiserror = "2.0.11"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

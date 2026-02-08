@@ -1,0 +1,16 @@
+[package]
+name = "nanopython-bin-min"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nanopython"
+path = "src/main.rs"
+
+[dependencies]
+nanopython-vm = { path = "../nanopython-vm" }
+nanopython-plugin-api = { path = "../nanopython-plugin-api" }
+nanopython-stdlib-core = { path = "../nanopython-stdlib-core" }
+nanopython-feature-enum-lite = { path = "../nanopython-feature-enum-lite" }
+nanopython-feature-dataclass-lite = { path = "../nanopython-feature-dataclass-lite" }

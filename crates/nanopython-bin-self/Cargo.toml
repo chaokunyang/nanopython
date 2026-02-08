@@ -1,0 +1,12 @@
+[package]
+name = "nanopython-bin-self"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nanopython-self"
+path = "src/main.rs"
+
+[dependencies]
+nanopython-selfvm = { path = "../nanopython-selfvm" }

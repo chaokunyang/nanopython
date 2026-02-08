@@ -1,0 +1,21 @@
+[package]
+name = "nanopython-bin-extended"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nanopython-extended"
+path = "src/main.rs"
+
+[features]
+default = []
+feature_enum_dynamic = []
+feature_dataclass_dynamic = []
+
+[dependencies]
+nanopython-vm = { path = "../nanopython-vm" }
+nanopython-plugin-api = { path = "../nanopython-plugin-api" }
+nanopython-stdlib-core = { path = "../nanopython-stdlib-core" }
+nanopython-feature-enum-lite = { path = "../nanopython-feature-enum-lite" }
+nanopython-feature-dataclass-lite = { path = "../nanopython-feature-dataclass-lite" }

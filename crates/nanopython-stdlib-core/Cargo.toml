@@ -1,0 +1,12 @@
+[package]
+name = "nanopython-stdlib-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nanopython-core = { path = "../nanopython-core" }
+nanopython-plugin-api = { path = "../nanopython-plugin-api" }
+nanopython-import = { path = "../nanopython-import" }
+rustpython-vm.workspace = true
+rustpython-derive = "0.4.0"

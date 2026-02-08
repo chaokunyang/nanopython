@@ -1,0 +1,9 @@
+[package]
+name = "nanopython-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nanopython-core = { path = "../nanopython-core" }
+nanopython-parser = { path = "../nanopython-parser" }
