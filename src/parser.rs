@@ -1,4 +1,6 @@
-use crate::ast::{BinaryOp, ExceptHandler, Expr, ImportItem, Param, ParamKind, Program, Stmt, UnaryOp};
+use crate::ast::{
+    BinaryOp, ExceptHandler, Expr, ImportItem, Param, ParamKind, Program, Stmt, UnaryOp,
+};
 use crate::token::{Keyword, Token, TokenKind};
 
 type ParseResult<T> = Result<T, String>;

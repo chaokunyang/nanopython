@@ -187,9 +187,7 @@ fn tokenize_line(
             i += 1;
             if chars[start] == '0' && i < chars.len() && matches!(chars[i], 'x' | 'X') {
                 i += 1;
-                while i < chars.len()
-                    && (chars[i].is_ascii_hexdigit() || chars[i] == '_')
-                {
+                while i < chars.len() && (chars[i].is_ascii_hexdigit() || chars[i] == '_') {
                     i += 1;
                 }
             } else {

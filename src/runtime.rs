@@ -7,7 +7,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 pub type RtResult<T> = Result<T, String>;
 
@@ -344,12 +344,140 @@ enum Flow {
     Continue,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+enum GcObjectId {
+    List(usize),
+    Dict(usize),
+    Instance(usize),
+    Module(usize),
+    Namespace(usize),
+    ArgParser(usize),
+    Generator(usize),
+}
+
+#[derive(Clone)]
+enum GcTrackedObject {
+    List(Weak<RefCell<Vec<Value>>>),
+    Dict(Weak<RefCell<BTreeMap<Key, Value>>>),
+    Instance(Weak<RefCell<Instance>>),
+    Module(Weak<RefCell<Module>>),
+    Namespace(Weak<RefCell<HashMap<String, Value>>>),
+    ArgParser(Weak<RefCell<ArgParser>>),
+    Generator(Weak<RefCell<Generator>>),
+}
+
+impl GcTrackedObject {
+    fn id(&self) -> GcObjectId {
+        match self {
+            Self::List(v) => GcObjectId::List(v.as_ptr() as usize),
+            Self::Dict(v) => GcObjectId::Dict(v.as_ptr() as usize),
+            Self::Instance(v) => GcObjectId::Instance(v.as_ptr() as usize),
+            Self::Module(v) => GcObjectId::Module(v.as_ptr() as usize),
+            Self::Namespace(v) => GcObjectId::Namespace(v.as_ptr() as usize),
+            Self::ArgParser(v) => GcObjectId::ArgParser(v.as_ptr() as usize),
+            Self::Generator(v) => GcObjectId::Generator(v.as_ptr() as usize),
+        }
+    }
+
+    fn is_alive(&self) -> bool {
+        match self {
+            Self::List(v) => v.strong_count() > 0,
+            Self::Dict(v) => v.strong_count() > 0,
+            Self::Instance(v) => v.strong_count() > 0,
+            Self::Module(v) => v.strong_count() > 0,
+            Self::Namespace(v) => v.strong_count() > 0,
+            Self::ArgParser(v) => v.strong_count() > 0,
+            Self::Generator(v) => v.strong_count() > 0,
+        }
+    }
+
+    fn clear_edges(&self) -> bool {
+        match self {
+            Self::List(v) => v.upgrade().is_some_and(|list| {
+                let mut borrow = list.borrow_mut();
+                let had = !borrow.is_empty();
+                borrow.clear();
+                had
+            }),
+            Self::Dict(v) => v.upgrade().is_some_and(|dict| {
+                let mut borrow = dict.borrow_mut();
+                let had = !borrow.is_empty();
+                borrow.clear();
+                had
+            }),
+            Self::Instance(v) => v.upgrade().is_some_and(|inst| {
+                let mut borrow = inst.borrow_mut();
+                let had = !borrow.fields.is_empty();
+                borrow.fields.clear();
+                had
+            }),
+            Self::Module(v) => v.upgrade().is_some_and(|module| {
+                let mut borrow = module.borrow_mut();
+                let had = !borrow.attrs.is_empty();
+                borrow.attrs.clear();
+                had
+            }),
+            Self::Namespace(v) => v.upgrade().is_some_and(|ns| {
+                let mut borrow = ns.borrow_mut();
+                let had = !borrow.is_empty();
+                borrow.clear();
+                had
+            }),
+            Self::ArgParser(v) => v.upgrade().is_some_and(|parser| {
+                let mut borrow = parser.borrow_mut();
+                let had = !borrow.specs.is_empty();
+                borrow.specs.clear();
+                had
+            }),
+            Self::Generator(v) => v.upgrade().is_some_and(|generator| {
+                let mut borrow = generator.borrow_mut();
+                let had_values = !borrow.values.is_empty();
+                borrow.values.clear();
+                let mut scope = borrow.call_env.0.borrow_mut();
+                let had_scope = !scope.values.is_empty();
+                scope.values.clear();
+                had_values || had_scope
+            }),
+        }
+    }
+}
+
+struct GcState {
+    enabled: bool,
+    periodic_counter: usize,
+    periodic_threshold: usize,
+    tracked: Vec<GcTrackedObject>,
+    known: HashSet<GcObjectId>,
+}
+
+impl GcState {
+    fn new() -> Self {
+        Self {
+            enabled: true,
+            periodic_counter: 0,
+            periodic_threshold: 256,
+            tracked: Vec::new(),
+            known: HashSet::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct MarkState {
+    reachable: HashSet<GcObjectId>,
+    seen_envs: HashSet<usize>,
+    seen_functions: HashSet<usize>,
+    seen_classes: HashSet<usize>,
+}
+
 pub struct Interpreter {
     modules: HashMap<String, Value>,
     blocked_roots: HashSet<String>,
     search_paths: Vec<PathBuf>,
     argv: Vec<String>,
     call_stack: Vec<Env>,
+    active_envs: Vec<Env>,
+    gc: GcState,
 }
 
 impl Interpreter {
@@ -370,6 +498,8 @@ impl Interpreter {
             search_paths: vec![PathBuf::from(".")],
             argv: Vec::new(),
             call_stack: Vec::new(),
+            active_envs: Vec::new(),
+            gc: GcState::new(),
         }
     }
 
@@ -379,6 +509,626 @@ impl Interpreter {
 
     pub fn set_argv(&mut self, argv: Vec<String>) {
         self.argv = argv;
+    }
+
+    fn gc_register(&mut self, object: GcTrackedObject) {
+        let id = object.id();
+        if self.gc.known.insert(id) {
+            self.gc.tracked.push(object);
+        }
+    }
+
+    fn track_value_recursive(&mut self, value: &Value) {
+        let mut seen_objects = HashSet::<GcObjectId>::new();
+        let mut seen_envs = HashSet::<usize>::new();
+        let mut seen_functions = HashSet::<usize>::new();
+        let mut seen_classes = HashSet::<usize>::new();
+        self.track_value_inner(
+            value,
+            &mut seen_objects,
+            &mut seen_envs,
+            &mut seen_functions,
+            &mut seen_classes,
+        );
+    }
+
+    fn track_env_inner(
+        &mut self,
+        env: &Env,
+        seen_objects: &mut HashSet<GcObjectId>,
+        seen_envs: &mut HashSet<usize>,
+        seen_functions: &mut HashSet<usize>,
+        seen_classes: &mut HashSet<usize>,
+    ) {
+        let env_id = Rc::as_ptr(&env.0) as usize;
+        if !seen_envs.insert(env_id) {
+            return;
+        }
+        let (values, parent) = {
+            let scope = env.0.borrow();
+            (
+                scope.values.values().cloned().collect::<Vec<_>>(),
+                scope.parent.clone(),
+            )
+        };
+        for value in values {
+            self.track_value_inner(
+                &value,
+                seen_objects,
+                seen_envs,
+                seen_functions,
+                seen_classes,
+            );
+        }
+        if let Some(parent) = parent {
+            self.track_env_inner(
+                &parent,
+                seen_objects,
+                seen_envs,
+                seen_functions,
+                seen_classes,
+            );
+        }
+    }
+
+    fn track_class_inner(
+        &mut self,
+        class: &Rc<Class>,
+        seen_objects: &mut HashSet<GcObjectId>,
+        seen_envs: &mut HashSet<usize>,
+        seen_functions: &mut HashSet<usize>,
+        seen_classes: &mut HashSet<usize>,
+    ) {
+        let class_id = Rc::as_ptr(class) as usize;
+        if !seen_classes.insert(class_id) {
+            return;
+        }
+        let attrs = class.attrs.borrow().values().cloned().collect::<Vec<_>>();
+        for value in attrs {
+            self.track_value_inner(
+                &value,
+                seen_objects,
+                seen_envs,
+                seen_functions,
+                seen_classes,
+            );
+        }
+        for base in &class.bases {
+            self.track_class_inner(base, seen_objects, seen_envs, seen_functions, seen_classes);
+        }
+    }
+
+    fn track_value_inner(
+        &mut self,
+        value: &Value,
+        seen_objects: &mut HashSet<GcObjectId>,
+        seen_envs: &mut HashSet<usize>,
+        seen_functions: &mut HashSet<usize>,
+        seen_classes: &mut HashSet<usize>,
+    ) {
+        match value {
+            Value::List(list) => {
+                let id = GcObjectId::List(Rc::as_ptr(list) as usize);
+                if !seen_objects.insert(id) {
+                    return;
+                }
+                self.gc_register(GcTrackedObject::List(Rc::downgrade(list)));
+                let children = list.borrow().clone();
+                for child in children {
+                    self.track_value_inner(
+                        &child,
+                        seen_objects,
+                        seen_envs,
+                        seen_functions,
+                        seen_classes,
+                    );
+                }
+            }
+            Value::Dict(dict) => {
+                let id = GcObjectId::Dict(Rc::as_ptr(dict) as usize);
+                if !seen_objects.insert(id) {
+                    return;
+                }
+                self.gc_register(GcTrackedObject::Dict(Rc::downgrade(dict)));
+                let values = dict.borrow().values().cloned().collect::<Vec<_>>();
+                for child in values {
+                    self.track_value_inner(
+                        &child,
+                        seen_objects,
+                        seen_envs,
+                        seen_functions,
+                        seen_classes,
+                    );
+                }
+            }
+            Value::Instance(instance) => {
+                let id = GcObjectId::Instance(Rc::as_ptr(instance) as usize);
+                if !seen_objects.insert(id) {
+                    return;
+                }
+                self.gc_register(GcTrackedObject::Instance(Rc::downgrade(instance)));
+                let (fields, class) = {
+                    let borrow = instance.borrow();
+                    (
+                        borrow.fields.values().cloned().collect::<Vec<_>>(),
+                        borrow.class.clone(),
+                    )
+                };
+                for child in fields {
+                    self.track_value_inner(
+                        &child,
+                        seen_objects,
+                        seen_envs,
+                        seen_functions,
+                        seen_classes,
+                    );
+                }
+                self.track_class_inner(
+                    &class,
+                    seen_objects,
+                    seen_envs,
+                    seen_functions,
+                    seen_classes,
+                );
+            }
+            Value::Module(module) => {
+                let id = GcObjectId::Module(Rc::as_ptr(module) as usize);
+                if !seen_objects.insert(id) {
+                    return;
+                }
+                self.gc_register(GcTrackedObject::Module(Rc::downgrade(module)));
+                let children = module.borrow().attrs.values().cloned().collect::<Vec<_>>();
+                for child in children {
+                    self.track_value_inner(
+                        &child,
+                        seen_objects,
+                        seen_envs,
+                        seen_functions,
+                        seen_classes,
+                    );
+                }
+            }
+            Value::Namespace(ns) => {
+                let id = GcObjectId::Namespace(Rc::as_ptr(ns) as usize);
+                if !seen_objects.insert(id) {
+                    return;
+                }
+                self.gc_register(GcTrackedObject::Namespace(Rc::downgrade(ns)));
+                let children = ns.borrow().values().cloned().collect::<Vec<_>>();
+                for child in children {
+                    self.track_value_inner(
+                        &child,
+                        seen_objects,
+                        seen_envs,
+                        seen_functions,
+                        seen_classes,
+                    );
+                }
+            }
+            Value::ArgParser(parser) => {
+                let id = GcObjectId::ArgParser(Rc::as_ptr(parser) as usize);
+                if !seen_objects.insert(id) {
+                    return;
+                }
+                self.gc_register(GcTrackedObject::ArgParser(Rc::downgrade(parser)));
+                let entries = parser
+                    .borrow()
+                    .specs
+                    .iter()
+                    .map(|spec| (spec.arg_type.clone(), spec.default.clone()))
+                    .collect::<Vec<_>>();
+                for (arg_type, default) in entries {
+                    if let Some(arg_type) = arg_type {
+                        self.track_value_inner(
+                            &arg_type,
+                            seen_objects,
+                            seen_envs,
+                            seen_functions,
+                            seen_classes,
+                        );
+                    }
+                    self.track_value_inner(
+                        &default,
+                        seen_objects,
+                        seen_envs,
+                        seen_functions,
+                        seen_classes,
+                    );
+                }
+            }
+            Value::Generator(generator) => {
+                let id = GcObjectId::Generator(Rc::as_ptr(generator) as usize);
+                if !seen_objects.insert(id) {
+                    return;
+                }
+                self.gc_register(GcTrackedObject::Generator(Rc::downgrade(generator)));
+                let (values, function, call_env) = {
+                    let borrow = generator.borrow();
+                    (
+                        borrow.values.clone(),
+                        borrow.function.clone(),
+                        borrow.call_env.clone(),
+                    )
+                };
+                for child in values {
+                    self.track_value_inner(
+                        &child,
+                        seen_objects,
+                        seen_envs,
+                        seen_functions,
+                        seen_classes,
+                    );
+                }
+                self.track_env_inner(
+                    &call_env,
+                    seen_objects,
+                    seen_envs,
+                    seen_functions,
+                    seen_classes,
+                );
+                self.track_value_inner(
+                    &Value::Function(function),
+                    seen_objects,
+                    seen_envs,
+                    seen_functions,
+                    seen_classes,
+                );
+            }
+            Value::Function(function)
+            | Value::ClassMethod(function)
+            | Value::Property(function) => {
+                let function_id = Rc::as_ptr(function) as usize;
+                if seen_functions.insert(function_id) {
+                    self.track_env_inner(
+                        &function.env,
+                        seen_objects,
+                        seen_envs,
+                        seen_functions,
+                        seen_classes,
+                    );
+                }
+            }
+            Value::Class(class) => {
+                self.track_class_inner(class, seen_objects, seen_envs, seen_functions, seen_classes)
+            }
+            Value::BoundMethod(method) => {
+                self.track_value_inner(
+                    &Value::Instance(method.instance.clone()),
+                    seen_objects,
+                    seen_envs,
+                    seen_functions,
+                    seen_classes,
+                );
+                self.track_value_inner(
+                    &Value::Function(method.function.clone()),
+                    seen_objects,
+                    seen_envs,
+                    seen_functions,
+                    seen_classes,
+                );
+                self.track_class_inner(
+                    &method.owner_class,
+                    seen_objects,
+                    seen_envs,
+                    seen_functions,
+                    seen_classes,
+                );
+            }
+            Value::BoundClassMethod(method) => {
+                self.track_class_inner(
+                    &method.class,
+                    seen_objects,
+                    seen_envs,
+                    seen_functions,
+                    seen_classes,
+                );
+                self.track_value_inner(
+                    &Value::Function(method.function.clone()),
+                    seen_objects,
+                    seen_envs,
+                    seen_functions,
+                    seen_classes,
+                );
+            }
+            Value::Builtin(Builtin::BoundList { list, .. }) => {
+                self.track_value_inner(
+                    &Value::List(list.clone()),
+                    seen_objects,
+                    seen_envs,
+                    seen_functions,
+                    seen_classes,
+                );
+            }
+            Value::Builtin(Builtin::BoundDict { dict, .. }) => {
+                self.track_value_inner(
+                    &Value::Dict(dict.clone()),
+                    seen_objects,
+                    seen_envs,
+                    seen_functions,
+                    seen_classes,
+                );
+            }
+            Value::Builtin(Builtin::BoundNamespace { value, .. }) => {
+                self.track_value_inner(
+                    &Value::Namespace(value.clone()),
+                    seen_objects,
+                    seen_envs,
+                    seen_functions,
+                    seen_classes,
+                );
+            }
+            Value::Builtin(Builtin::BoundArgParser { value, .. }) => {
+                self.track_value_inner(
+                    &Value::ArgParser(value.clone()),
+                    seen_objects,
+                    seen_envs,
+                    seen_functions,
+                    seen_classes,
+                );
+            }
+            Value::StaticMethod(inner) => {
+                self.track_value_inner(inner, seen_objects, seen_envs, seen_functions, seen_classes)
+            }
+            Value::Super(sup) => {
+                self.track_value_inner(
+                    &Value::Instance(sup.instance.clone()),
+                    seen_objects,
+                    seen_envs,
+                    seen_functions,
+                    seen_classes,
+                );
+                self.track_class_inner(
+                    &sup.class,
+                    seen_objects,
+                    seen_envs,
+                    seen_functions,
+                    seen_classes,
+                );
+            }
+            Value::FieldSpec(spec) => {
+                if let Some(default) = &spec.default {
+                    self.track_value_inner(
+                        default,
+                        seen_objects,
+                        seen_envs,
+                        seen_functions,
+                        seen_classes,
+                    );
+                }
+                if let Some(factory) = &spec.default_factory {
+                    self.track_value_inner(
+                        factory,
+                        seen_objects,
+                        seen_envs,
+                        seen_functions,
+                        seen_classes,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn mark_env(&self, env: &Env, state: &mut MarkState) {
+        let env_id = Rc::as_ptr(&env.0) as usize;
+        if !state.seen_envs.insert(env_id) {
+            return;
+        }
+        let (values, parent) = {
+            let scope = env.0.borrow();
+            (
+                scope.values.values().cloned().collect::<Vec<_>>(),
+                scope.parent.clone(),
+            )
+        };
+        for value in values {
+            self.mark_value(&value, state);
+        }
+        if let Some(parent) = parent {
+            self.mark_env(&parent, state);
+        }
+    }
+
+    fn mark_class(&self, class: &Rc<Class>, state: &mut MarkState) {
+        let class_id = Rc::as_ptr(class) as usize;
+        if !state.seen_classes.insert(class_id) {
+            return;
+        }
+        let attrs = class.attrs.borrow().values().cloned().collect::<Vec<_>>();
+        for value in attrs {
+            self.mark_value(&value, state);
+        }
+        for base in &class.bases {
+            self.mark_class(base, state);
+        }
+    }
+
+    fn mark_value(&self, value: &Value, state: &mut MarkState) {
+        match value {
+            Value::List(list) => {
+                let id = GcObjectId::List(Rc::as_ptr(list) as usize);
+                if !state.reachable.insert(id) {
+                    return;
+                }
+                let children = list.borrow().clone();
+                for child in children {
+                    self.mark_value(&child, state);
+                }
+            }
+            Value::Dict(dict) => {
+                let id = GcObjectId::Dict(Rc::as_ptr(dict) as usize);
+                if !state.reachable.insert(id) {
+                    return;
+                }
+                let children = dict.borrow().values().cloned().collect::<Vec<_>>();
+                for child in children {
+                    self.mark_value(&child, state);
+                }
+            }
+            Value::Instance(instance) => {
+                let id = GcObjectId::Instance(Rc::as_ptr(instance) as usize);
+                if !state.reachable.insert(id) {
+                    return;
+                }
+                let (fields, class) = {
+                    let borrow = instance.borrow();
+                    (
+                        borrow.fields.values().cloned().collect::<Vec<_>>(),
+                        borrow.class.clone(),
+                    )
+                };
+                for child in fields {
+                    self.mark_value(&child, state);
+                }
+                self.mark_class(&class, state);
+            }
+            Value::Module(module) => {
+                let id = GcObjectId::Module(Rc::as_ptr(module) as usize);
+                if !state.reachable.insert(id) {
+                    return;
+                }
+                let children = module.borrow().attrs.values().cloned().collect::<Vec<_>>();
+                for child in children {
+                    self.mark_value(&child, state);
+                }
+            }
+            Value::Namespace(ns) => {
+                let id = GcObjectId::Namespace(Rc::as_ptr(ns) as usize);
+                if !state.reachable.insert(id) {
+                    return;
+                }
+                let children = ns.borrow().values().cloned().collect::<Vec<_>>();
+                for child in children {
+                    self.mark_value(&child, state);
+                }
+            }
+            Value::ArgParser(parser) => {
+                let id = GcObjectId::ArgParser(Rc::as_ptr(parser) as usize);
+                if !state.reachable.insert(id) {
+                    return;
+                }
+                let entries = parser
+                    .borrow()
+                    .specs
+                    .iter()
+                    .map(|spec| (spec.arg_type.clone(), spec.default.clone()))
+                    .collect::<Vec<_>>();
+                for (arg_type, default) in entries {
+                    if let Some(arg_type) = arg_type {
+                        self.mark_value(&arg_type, state);
+                    }
+                    self.mark_value(&default, state);
+                }
+            }
+            Value::Generator(generator) => {
+                let id = GcObjectId::Generator(Rc::as_ptr(generator) as usize);
+                if !state.reachable.insert(id) {
+                    return;
+                }
+                let (values, function, call_env) = {
+                    let borrow = generator.borrow();
+                    (
+                        borrow.values.clone(),
+                        borrow.function.clone(),
+                        borrow.call_env.clone(),
+                    )
+                };
+                for child in values {
+                    self.mark_value(&child, state);
+                }
+                self.mark_env(&call_env, state);
+                self.mark_value(&Value::Function(function), state);
+            }
+            Value::Function(function)
+            | Value::ClassMethod(function)
+            | Value::Property(function) => {
+                let function_id = Rc::as_ptr(function) as usize;
+                if state.seen_functions.insert(function_id) {
+                    self.mark_env(&function.env, state);
+                }
+            }
+            Value::Class(class) => self.mark_class(class, state),
+            Value::BoundMethod(method) => {
+                self.mark_value(&Value::Instance(method.instance.clone()), state);
+                self.mark_value(&Value::Function(method.function.clone()), state);
+                self.mark_class(&method.owner_class, state);
+            }
+            Value::BoundClassMethod(method) => {
+                self.mark_class(&method.class, state);
+                self.mark_value(&Value::Function(method.function.clone()), state);
+            }
+            Value::Builtin(Builtin::BoundList { list, .. }) => {
+                self.mark_value(&Value::List(list.clone()), state)
+            }
+            Value::Builtin(Builtin::BoundDict { dict, .. }) => {
+                self.mark_value(&Value::Dict(dict.clone()), state)
+            }
+            Value::Builtin(Builtin::BoundNamespace { value, .. }) => {
+                self.mark_value(&Value::Namespace(value.clone()), state)
+            }
+            Value::Builtin(Builtin::BoundArgParser { value, .. }) => {
+                self.mark_value(&Value::ArgParser(value.clone()), state)
+            }
+            Value::StaticMethod(inner) => self.mark_value(inner, state),
+            Value::Super(sup) => {
+                self.mark_value(&Value::Instance(sup.instance.clone()), state);
+                self.mark_class(&sup.class, state);
+            }
+            Value::FieldSpec(spec) => {
+                if let Some(default) = &spec.default {
+                    self.mark_value(default, state);
+                }
+                if let Some(factory) = &spec.default_factory {
+                    self.mark_value(factory, state);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn prune_gc_registry(&mut self) {
+        self.gc.tracked.retain(GcTrackedObject::is_alive);
+        self.gc.known.clear();
+        for object in &self.gc.tracked {
+            self.gc.known.insert(object.id());
+        }
+    }
+
+    fn collect_cycles(&mut self) -> usize {
+        self.prune_gc_registry();
+        let mut state = MarkState::default();
+        for value in self.modules.values() {
+            self.mark_value(value, &mut state);
+        }
+        for env in &self.active_envs {
+            self.mark_env(env, &mut state);
+        }
+        for env in &self.call_stack {
+            self.mark_env(env, &mut state);
+        }
+
+        let mut collected = 0usize;
+        for object in &self.gc.tracked {
+            if state.reachable.contains(&object.id()) {
+                continue;
+            }
+            if object.clear_edges() {
+                collected += 1;
+            }
+        }
+        self.prune_gc_registry();
+        self.gc.periodic_counter = 0;
+        collected
+    }
+
+    fn maybe_periodic_gc(&mut self) {
+        if !self.gc.enabled {
+            return;
+        }
+        self.gc.periodic_counter = self.gc.periodic_counter.saturating_add(1);
+        if self.gc.periodic_counter >= self.gc.periodic_threshold {
+            let _ = self.collect_cycles();
+        }
     }
 
     pub fn run_program(&mut self, program: &Program, module_name: &str) -> RtResult<Env> {
@@ -462,10 +1212,16 @@ impl Interpreter {
             "isinstance",
             Value::Builtin(Builtin::Native(builtin_isinstance)),
         );
-        env.set_local("enumerate", Value::Builtin(Builtin::Native(builtin_enumerate)));
+        env.set_local(
+            "enumerate",
+            Value::Builtin(Builtin::Native(builtin_enumerate)),
+        );
         env.set_local("zip", Value::Builtin(Builtin::Native(builtin_zip)));
         env.set_local("sorted", Value::Builtin(Builtin::Native(builtin_sorted)));
-        env.set_local("reversed", Value::Builtin(Builtin::Native(builtin_reversed)));
+        env.set_local(
+            "reversed",
+            Value::Builtin(Builtin::Native(builtin_reversed)),
+        );
         env.set_local("min", Value::Builtin(Builtin::Native(builtin_min)));
         env.set_local("max", Value::Builtin(Builtin::Native(builtin_max)));
         env.set_local("any", Value::Builtin(Builtin::Native(builtin_any)));
@@ -479,7 +1235,10 @@ impl Interpreter {
             "staticmethod",
             Value::Builtin(Builtin::Native(builtin_staticmethod)),
         );
-        env.set_local("property", Value::Builtin(Builtin::Native(builtin_property)));
+        env.set_local(
+            "property",
+            Value::Builtin(Builtin::Native(builtin_property)),
+        );
 
         let mut object_attrs = HashMap::new();
         object_attrs.insert(
@@ -556,14 +1315,19 @@ impl Interpreter {
     }
 
     fn exec_block(&mut self, body: &[Stmt], env: Env, mode: &ExecMode) -> RtResult<Flow> {
-        for stmt in body {
-            let flow = self.exec_stmt(stmt, env.clone(), mode)?;
-            match flow {
-                Flow::Next => {}
-                Flow::Return(_) | Flow::Break | Flow::Continue => return Ok(flow),
+        self.active_envs.push(env.clone());
+        let result = (|| {
+            for stmt in body {
+                let flow = self.exec_stmt(stmt, env.clone(), mode)?;
+                match flow {
+                    Flow::Next => self.maybe_periodic_gc(),
+                    Flow::Return(_) | Flow::Break | Flow::Continue => return Ok(flow),
+                }
             }
-        }
-        Ok(Flow::Next)
+            Ok(Flow::Next)
+        })();
+        let _ = self.active_envs.pop();
+        result
     }
 
     fn exec_stmt(&mut self, stmt: &Stmt, env: Env, mode: &ExecMode) -> RtResult<Flow> {
@@ -640,6 +1404,7 @@ impl Interpreter {
                     let deco_value = self.eval_expr(deco, env.clone(), mode)?;
                     value = self.call_callable(deco_value, vec![value], HashMap::new())?;
                 }
+                self.track_value_recursive(&value);
                 env.set_local(name.clone(), value);
                 Ok(Flow::Next)
             }
@@ -669,6 +1434,7 @@ impl Interpreter {
                                 attr_order.push(name.clone());
                                 if let Some(expr) = value {
                                     let rhs = self.eval_expr(expr, class_env.clone(), mode)?;
+                                    self.track_value_recursive(&rhs);
                                     class_env.set_local(name.clone(), rhs.clone());
                                     field_defs.push(ClassFieldDef {
                                         name: name.clone(),
@@ -727,8 +1493,10 @@ impl Interpreter {
                 let mut class_value = Value::Class(class);
                 for deco in decorators.iter().rev() {
                     let deco_value = self.eval_expr(deco, env.clone(), mode)?;
-                    class_value = self.call_callable(deco_value, vec![class_value], HashMap::new())?;
+                    class_value =
+                        self.call_callable(deco_value, vec![class_value], HashMap::new())?;
                 }
+                self.track_value_recursive(&class_value);
                 env.set_local(name.clone(), class_value);
                 Ok(Flow::Next)
             }
@@ -757,6 +1525,7 @@ impl Interpreter {
                     let root = name.split('.').next().unwrap_or(name);
                     let _ = self.import_module(name)?;
                     let root_module = self.import_module(root)?;
+                    self.track_value_recursive(&root_module);
                     env.set_local(root.to_owned(), root_module);
                 }
                 Ok(Flow::Next)
@@ -764,10 +1533,11 @@ impl Interpreter {
             Stmt::FromImport { module, names } => {
                 let module_value = self.import_module(module)?;
                 for item in names {
-                    let value = self
-                        .get_attr(&module_value, &item.name)?
-                        .ok_or_else(|| format!("module '{module}' has no attribute '{}'", item.name))?;
+                    let value = self.get_attr(&module_value, &item.name)?.ok_or_else(|| {
+                        format!("module '{module}' has no attribute '{}'", item.name)
+                    })?;
                     let bind_name = item.asname.as_ref().unwrap_or(&item.name);
+                    self.track_value_recursive(&value);
                     env.set_local(bind_name.clone(), value);
                 }
                 Ok(Flow::Next)
@@ -790,6 +1560,7 @@ impl Interpreter {
                     .ok_or_else(|| "context object has no __enter__".to_owned())?;
                 let entered = self.call_callable(enter, Vec::new(), HashMap::new())?;
                 if let Some(name) = asname {
+                    self.track_value_recursive(&entered);
                     env.set_local(name.clone(), entered);
                 }
                 let body_flow = self.exec_block(body, env.clone(), mode)?;
@@ -829,7 +1600,9 @@ impl Interpreter {
                                     ex.insert("line".to_owned(), Value::Int(0));
                                     ex.insert("column".to_owned(), Value::Int(0));
                                     ex.insert("file".to_owned(), Value::Str(String::new()));
-                                    env.set_local(name.clone(), Value::Namespace(Rc::new(RefCell::new(ex))));
+                                    let namespace = Value::Namespace(Rc::new(RefCell::new(ex)));
+                                    self.track_value_recursive(&namespace);
+                                    env.set_local(name.clone(), namespace);
                                 }
                                 handled_flow = self.exec_block(&handler.body, env.clone(), mode)?;
                                 handled = true;
@@ -1049,8 +1822,9 @@ impl Interpreter {
             }
             Expr::Attr { value, name } => {
                 let obj = self.eval_expr(value, env, mode)?;
-                self.get_attr(&obj, name)?
-                    .ok_or_else(|| format!("attribute '{name}' not found on {}", display_value(&obj)))
+                self.get_attr(&obj, name)?.ok_or_else(|| {
+                    format!("attribute '{name}' not found on {}", display_value(&obj))
+                })
             }
             Expr::Subscript { value, index } => {
                 let base = self.eval_expr(value, env.clone(), mode)?;
@@ -1068,7 +1842,10 @@ impl Interpreter {
                 } else {
                     Value::None
                 };
-                Ok(Value::List(Rc::new(RefCell::new(vec![start_value, stop_value]))))
+                Ok(Value::List(Rc::new(RefCell::new(vec![
+                    start_value,
+                    stop_value,
+                ]))))
             }
             Expr::Yield(value) => match mode {
                 ExecMode::Normal => Err("yield outside generator".to_owned()),
@@ -1280,6 +2057,7 @@ impl Interpreter {
         env: Env,
         mode: &ExecMode,
     ) -> RtResult<()> {
+        self.track_value_recursive(&value);
         match target {
             Expr::Name(name) => {
                 env.set_local(name.clone(), value);
@@ -1364,12 +2142,9 @@ impl Interpreter {
                 self.call_function(bound.function.clone(), None, None, full_args, kwargs)
             }
             Value::Class(class) => self.call_class(class, args, kwargs),
-            Value::ArgParser(parser) => self.call_arg_parser_method(
-                parser,
-                ArgParserMethod::ParseArgs,
-                args,
-                kwargs,
-            ),
+            Value::ArgParser(parser) => {
+                self.call_arg_parser_method(parser, ArgParserMethod::ParseArgs, args, kwargs)
+            }
             _ => Err(format!(
                 "object '{}' is not callable",
                 display_value(&callable)
@@ -1439,7 +2214,9 @@ impl Interpreter {
                         Vec::new()
                     };
                     arg_index = args.len();
-                    call_env.set_local(param.name.clone(), Value::List(Rc::new(RefCell::new(rest))));
+                    let rest_value = Value::List(Rc::new(RefCell::new(rest)));
+                    self.track_value_recursive(&rest_value);
+                    call_env.set_local(param.name.clone(), rest_value);
                 }
                 ParamKind::VarKwargs => {
                     var_kwargs_name = Some(param.name.clone());
@@ -1469,7 +2246,9 @@ impl Interpreter {
             }
         }
         if let Some(name) = var_kwargs_name {
-            call_env.set_local(name, Value::Dict(Rc::new(RefCell::new(extra_kwargs))));
+            let kwargs_value = Value::Dict(Rc::new(RefCell::new(extra_kwargs)));
+            self.track_value_recursive(&kwargs_value);
+            call_env.set_local(name, kwargs_value);
         }
 
         if function.is_generator {
@@ -1502,6 +2281,7 @@ impl Interpreter {
             class: class.clone(),
             fields: HashMap::new(),
         }));
+        self.track_value_recursive(&Value::Instance(instance.clone()));
         if class
             .attrs
             .borrow()
@@ -1721,7 +2501,12 @@ impl Interpreter {
                 let items = dict
                     .borrow()
                     .iter()
-                    .map(|(k, v)| Value::List(Rc::new(RefCell::new(vec![Value::from(k.clone()), v.clone()]))))
+                    .map(|(k, v)| {
+                        Value::List(Rc::new(RefCell::new(vec![
+                            Value::from(k.clone()),
+                            v.clone(),
+                        ])))
+                    })
                     .collect::<Vec<_>>();
                 Ok(Value::List(Rc::new(RefCell::new(items))))
             }
@@ -1903,7 +2688,9 @@ impl Interpreter {
                     Ok(Value::Str(value.trim().to_owned()))
                 } else if args.len() == 1 {
                     let chars = expect_str_arg(&args[0], "strip()")?;
-                    Ok(Value::Str(value.trim_matches(|c| chars.contains(c)).to_owned()))
+                    Ok(Value::Str(
+                        value.trim_matches(|c| chars.contains(c)).to_owned(),
+                    ))
                 } else {
                     Err("strip() expects at most one argument".to_owned())
                 }
@@ -2168,7 +2955,12 @@ impl Interpreter {
             ArgParserMethod::AddMutuallyExclusiveGroup => Ok(Value::ArgParser(value)),
             ArgParserMethod::ParseArgs => {
                 let input_args = if args.is_empty() || matches!(args.first(), Some(Value::None)) {
-                    self.argv.iter().skip(1).cloned().map(Value::Str).collect::<Vec<_>>()
+                    self.argv
+                        .iter()
+                        .skip(1)
+                        .cloned()
+                        .map(Value::Str)
+                        .collect::<Vec<_>>()
                 } else if args.len() == 1 {
                     self.collect_iterable(args[0].clone())?
                 } else {
@@ -2223,13 +3015,16 @@ impl Interpreter {
                                 };
                                 let mut parsed = Value::Str(raw_value);
                                 if let Some(arg_type) = &spec.arg_type {
-                                    parsed =
-                                        self.call_callable(arg_type.clone(), vec![parsed], HashMap::new())?;
+                                    parsed = self.call_callable(
+                                        arg_type.clone(),
+                                        vec![parsed],
+                                        HashMap::new(),
+                                    )?;
                                 }
                                 if spec.action == ArgAction::Append {
-                                    let entry = ns
-                                        .entry(spec.dest.clone())
-                                        .or_insert_with(|| Value::List(Rc::new(RefCell::new(Vec::new()))));
+                                    let entry = ns.entry(spec.dest.clone()).or_insert_with(|| {
+                                        Value::List(Rc::new(RefCell::new(Vec::new())))
+                                    });
                                     if let Value::List(list) = entry {
                                         list.borrow_mut().push(parsed);
                                     }
@@ -2261,8 +3056,11 @@ impl Interpreter {
                         for item in positional_values {
                             let mut parsed = Value::Str(item);
                             if let Some(arg_type) = &spec.arg_type {
-                                parsed =
-                                    self.call_callable(arg_type.clone(), vec![parsed], HashMap::new())?;
+                                parsed = self.call_callable(
+                                    arg_type.clone(),
+                                    vec![parsed],
+                                    HashMap::new(),
+                                )?;
                             }
                             out.push(parsed);
                         }
@@ -2274,8 +3072,11 @@ impl Interpreter {
                             }
                             let mut parsed = Value::Str(positional_values[idx].clone());
                             if let Some(arg_type) = &spec.arg_type {
-                                parsed =
-                                    self.call_callable(arg_type.clone(), vec![parsed], HashMap::new())?;
+                                parsed = self.call_callable(
+                                    arg_type.clone(),
+                                    vec![parsed],
+                                    HashMap::new(),
+                                )?;
                             }
                             ns.insert(spec.dest.clone(), parsed);
                         }
@@ -2507,7 +3308,9 @@ impl Interpreter {
             Value::ArgParser(parser) => {
                 let method = match name {
                     "add_argument" => Some(ArgParserMethod::AddArgument),
-                    "add_mutually_exclusive_group" => Some(ArgParserMethod::AddMutuallyExclusiveGroup),
+                    "add_mutually_exclusive_group" => {
+                        Some(ArgParserMethod::AddMutuallyExclusiveGroup)
+                    }
                     "parse_args" => Some(ArgParserMethod::ParseArgs),
                     _ => None,
                 };
@@ -2542,6 +3345,7 @@ impl Interpreter {
     }
 
     fn set_attr(&mut self, value: Value, name: &str, attr_value: Value) -> RtResult<()> {
+        self.track_value_recursive(&attr_value);
         match value {
             Value::Module(module) => {
                 module
@@ -2576,8 +3380,16 @@ impl Interpreter {
                     let parts = slice_parts.borrow();
                     if parts.len() == 2 {
                         let len = items.borrow().len() as i64;
-                        let start = normalize_slice_bound(parts.first().cloned().unwrap_or(Value::None), len, 0)?;
-                        let stop = normalize_slice_bound(parts.get(1).cloned().unwrap_or(Value::None), len, len)?;
+                        let start = normalize_slice_bound(
+                            parts.first().cloned().unwrap_or(Value::None),
+                            len,
+                            0,
+                        )?;
+                        let stop = normalize_slice_bound(
+                            parts.get(1).cloned().unwrap_or(Value::None),
+                            len,
+                            len,
+                        )?;
                         let mut out = Vec::new();
                         for i in start..stop {
                             if let Some(v) = items.borrow().get(i as usize).cloned() {
@@ -2611,8 +3423,16 @@ impl Interpreter {
                     let len = chars.len() as i64;
                     let parts = slice_parts.borrow();
                     if parts.len() == 2 {
-                        let start = normalize_slice_bound(parts.first().cloned().unwrap_or(Value::None), len, 0)?;
-                        let stop = normalize_slice_bound(parts.get(1).cloned().unwrap_or(Value::None), len, len)?;
+                        let start = normalize_slice_bound(
+                            parts.first().cloned().unwrap_or(Value::None),
+                            len,
+                            0,
+                        )?;
+                        let stop = normalize_slice_bound(
+                            parts.get(1).cloned().unwrap_or(Value::None),
+                            len,
+                            len,
+                        )?;
                         let mut out = String::new();
                         for i in start..stop {
                             if let Some(ch) = chars.get(i as usize) {
@@ -2635,8 +3455,11 @@ impl Interpreter {
                     let len = data.len() as i64;
                     let parts = slice_parts.borrow();
                     if parts.len() == 2 {
-                        let start =
-                            normalize_slice_bound(parts.first().cloned().unwrap_or(Value::None), len, 0)?;
+                        let start = normalize_slice_bound(
+                            parts.first().cloned().unwrap_or(Value::None),
+                            len,
+                            0,
+                        )?;
                         let stop = normalize_slice_bound(
                             parts.get(1).cloned().unwrap_or(Value::None),
                             len,
@@ -2660,6 +3483,7 @@ impl Interpreter {
     }
 
     fn set_item(&mut self, value: Value, index: Value, rhs: Value) -> RtResult<()> {
+        self.track_value_recursive(&rhs);
         match value {
             Value::List(items) => {
                 if let Value::List(slice_parts) = &index {
@@ -2757,7 +3581,10 @@ impl Interpreter {
                     .file
                     .read_to_string(&mut data)
                     .map_err(|err| format!("read failed: {err}"))?;
-                Ok(data.lines().map(|line| Value::Str(line.to_owned())).collect())
+                Ok(data
+                    .lines()
+                    .map(|line| Value::Str(line.to_owned()))
+                    .collect())
             }
             Value::Path(path) => Ok(path
                 .to_string_lossy()
@@ -2841,6 +3668,7 @@ impl Interpreter {
         }
 
         if let Some(module) = self.try_builtin_module(name)? {
+            self.track_value_recursive(&module);
             self.modules.insert(name.to_owned(), module.clone());
             return Ok(module);
         }
@@ -2855,6 +3683,7 @@ impl Interpreter {
             attrs: HashMap::new(),
         }));
         let module = Value::Module(module_rc.clone());
+        self.track_value_recursive(&module);
         self.modules.insert(name.to_owned(), module.clone());
 
         let tokens =
@@ -3175,7 +4004,10 @@ fn finalize_enum_class(class: Rc<Class>, attr_order: &[String]) -> RtResult<()> 
         let Some(raw) = attrs.get(name).cloned() else {
             continue;
         };
-        if matches!(raw, Value::Function(_) | Value::Builtin(_) | Value::Class(_)) {
+        if matches!(
+            raw,
+            Value::Function(_) | Value::Builtin(_) | Value::Class(_)
+        ) {
             continue;
         }
         let value = match raw {
@@ -3308,11 +4140,20 @@ fn expr_contains_yield(expr: &Expr) -> bool {
                 || expr_contains_yield(iter)
                 || cond.as_ref().is_some_and(|c| expr_contains_yield(c))
         }
-        Expr::Name(_) | Expr::Int(_) | Expr::Str(_) | Expr::FStr(_) | Expr::Bool(_) | Expr::None => false,
+        Expr::Name(_)
+        | Expr::Int(_)
+        | Expr::Str(_)
+        | Expr::FStr(_)
+        | Expr::Bool(_)
+        | Expr::None => false,
     }
 }
 
-fn eval_compare(left: Value, right: Value, pred: fn(std::cmp::Ordering) -> bool) -> RtResult<Value> {
+fn eval_compare(
+    left: Value,
+    right: Value,
+    pred: fn(std::cmp::Ordering) -> bool,
+) -> RtResult<Value> {
     let ord = match (left, right) {
         (Value::Int(a), Value::Int(b)) => a.cmp(&b),
         (Value::Str(a), Value::Str(b)) => a.cmp(&b),
@@ -3426,11 +4267,9 @@ impl From<Key> for Value {
             Key::Bool(v) => Value::Bool(v),
             Key::Int(v) => Value::Int(v),
             Key::Str(v) => Value::Str(v),
-            Key::Tuple(values) => {
-                Value::List(Rc::new(RefCell::new(
-                    values.into_iter().map(Value::from).collect::<Vec<_>>(),
-                )))
-            }
+            Key::Tuple(values) => Value::List(Rc::new(RefCell::new(
+                values.into_iter().map(Value::from).collect::<Vec<_>>(),
+            ))),
         }
     }
 }
@@ -4163,7 +5002,10 @@ fn make_argparse_module() -> Value {
 
 fn make_pathlib_module() -> Value {
     let mut attrs = HashMap::new();
-    attrs.insert("Path".to_owned(), Value::Builtin(Builtin::Native(path_ctor)));
+    attrs.insert(
+        "Path".to_owned(),
+        Value::Builtin(Builtin::Native(path_ctor)),
+    );
     Value::Module(Rc::new(RefCell::new(Module {
         name: "pathlib".to_owned(),
         attrs,
@@ -4223,7 +5065,10 @@ fn make_abc_module() -> Value {
 
 fn make_warnings_module() -> Value {
     let mut attrs = HashMap::new();
-    attrs.insert("warn".to_owned(), Value::Builtin(Builtin::Native(warnings_warn)));
+    attrs.insert(
+        "warn".to_owned(),
+        Value::Builtin(Builtin::Native(warnings_warn)),
+    );
     Value::Module(Rc::new(RefCell::new(Module {
         name: "warnings".to_owned(),
         attrs,
@@ -4237,10 +5082,10 @@ fn make_keyword_module() -> Value {
         Value::Builtin(Builtin::Native(keyword_iskeyword)),
     );
     let kw = vec![
-        "False", "None", "True", "and", "as", "assert", "break", "class", "continue",
-        "def", "del", "elif", "else", "except", "finally", "for", "from", "global", "if",
-        "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return",
-        "try", "while", "with", "yield",
+        "False", "None", "True", "and", "as", "assert", "break", "class", "continue", "def", "del",
+        "elif", "else", "except", "finally", "for", "from", "global", "if", "import", "in", "is",
+        "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while", "with",
+        "yield",
     ]
     .into_iter()
     .map(|s| Value::Str(s.to_owned()))
@@ -4336,10 +5181,10 @@ fn keyword_iskeyword(
     }
     let name = expect_str_arg(&args[0], "iskeyword")?;
     let is_kw = [
-        "False", "None", "True", "and", "as", "assert", "break", "class", "continue",
-        "def", "del", "elif", "else", "except", "finally", "for", "from", "global", "if",
-        "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return",
-        "try", "while", "with", "yield",
+        "False", "None", "True", "and", "as", "assert", "break", "class", "continue", "def", "del",
+        "elif", "else", "except", "finally", "for", "from", "global", "if", "import", "in", "is",
+        "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while", "with",
+        "yield",
     ]
     .contains(&name.as_str());
     Ok(Value::Bool(is_kw))
@@ -4363,10 +5208,7 @@ fn make_os_module() -> Value {
         "remove".to_owned(),
         Value::Builtin(Builtin::Native(os_remove)),
     );
-    attrs.insert(
-        "walk".to_owned(),
-        Value::Builtin(Builtin::Native(os_walk)),
-    );
+    attrs.insert("walk".to_owned(), Value::Builtin(Builtin::Native(os_walk)));
 
     let mut path_attrs = HashMap::new();
     path_attrs.insert(
@@ -4696,33 +5538,39 @@ fn sys_exit(
 }
 
 fn gc_collect(
-    _interp: &mut Interpreter,
-    _args: Vec<Value>,
+    interp: &mut Interpreter,
+    args: Vec<Value>,
     _kwargs: HashMap<String, Value>,
 ) -> RtResult<Value> {
-    Ok(Value::Int(0))
+    if args.len() > 1 {
+        return Err("gc.collect() expects at most one argument".to_owned());
+    }
+    let collected = interp.collect_cycles();
+    Ok(Value::Int(collected as i64))
 }
 
 fn gc_disable(
-    _interp: &mut Interpreter,
+    interp: &mut Interpreter,
     _args: Vec<Value>,
     _kwargs: HashMap<String, Value>,
 ) -> RtResult<Value> {
+    interp.gc.enabled = false;
     Ok(Value::None)
 }
 
 fn gc_enable(
-    _interp: &mut Interpreter,
+    interp: &mut Interpreter,
     _args: Vec<Value>,
     _kwargs: HashMap<String, Value>,
 ) -> RtResult<Value> {
+    interp.gc.enabled = true;
     Ok(Value::None)
 }
 
 fn gc_isenabled(
-    _interp: &mut Interpreter,
+    interp: &mut Interpreter,
     _args: Vec<Value>,
     _kwargs: HashMap<String, Value>,
 ) -> RtResult<Value> {
-    Ok(Value::Bool(true))
+    Ok(Value::Bool(interp.gc.enabled))
 }
